@@ -210,7 +210,7 @@ function streamViaYtdlp(
 
       '--no-warnings',
 
-      '--quiet',
+      '--verbose',
 
       '--no-progress',
 

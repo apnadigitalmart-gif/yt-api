@@ -624,7 +624,7 @@ app.get(
 
             '--no-warnings',
 
-            '--quiet',
+            '--verbose',
 
             '--no-progress',
 

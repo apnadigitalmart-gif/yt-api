@@ -4,19 +4,29 @@
  *
  * Uses InnerTube API for metadata/search + yt-dlp for actual audio streaming.
  *
- * Usage:
- *   node server.js
+ * MOMO-2 YouTube MP3 support:
+ * YouTube
+ *   ↓
+ * yt-dlp + optional YouTube cookies
+ *   ↓
+ * FFmpeg
+ *   ↓
+ * MP3 128 kbps / 44.1 kHz
+ *   ↓
+ * MOMO-2 ESP32-S3
  *
  * Endpoints:
- *   GET  /api/search?q=...                 - Search YouTube
- *   GET  /api/video/:id                    - Get video info + audio streams
- *   GET  /api/stream/:id                   - Stream best audio directly
- *   GET  /api/stream/:id/:itag             - Stream specific format
- *   GET  /api/streammp3/:videoId           - Convert YouTube audio to MP3
- *   GET  /api/health                       - Health check
+ *   GET  /api/search?q=...
+ *   GET  /api/video/:id
+ *   GET  /api/stream/:id
+ *   GET  /api/stream/:id/:itag
+ *   GET  /api/streammp3/:videoId
+ *   GET  /api/health
  */
 
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const express = require('express');
 const { spawn } = require('child_process');
 
@@ -33,11 +43,103 @@ const PORT = process.env.PORT || 3000;
 
 
 // ──────────────────────────────────────────────
+// YouTube cookies
+//
+// Railway Variable:
+//   YOUTUBE_COOKIES
+//
+// The value must contain the complete Netscape-format
+// cookies.txt content.
+//
+// IMPORTANT:
+// Cookie contents are NEVER printed to logs.
+// ──────────────────────────────────────────────
+
+const YOUTUBE_COOKIE_FILE =
+  path.join(
+    os.tmpdir(),
+    'youtube-cookies.txt'
+  );
+
+
+function prepareYoutubeCookies() {
+
+  if (!process.env.YOUTUBE_COOKIES) {
+
+    console.log(
+      '[cookies] YOUTUBE_COOKIES not configured'
+    );
+
+    return false;
+
+  }
+
+
+  try {
+
+    fs.writeFileSync(
+      YOUTUBE_COOKIE_FILE,
+      process.env.YOUTUBE_COOKIES,
+      {
+        encoding: 'utf8',
+        mode: 0o600
+      }
+    );
+
+
+    console.log(
+      '[cookies] YouTube cookies loaded securely'
+    );
+
+
+    return true;
+
+  } catch (err) {
+
+    console.error(
+      '[cookies] Failed to prepare YouTube cookies:',
+      err.message
+    );
+
+    return false;
+
+  }
+
+}
+
+
+function getYoutubeCookieArgs() {
+
+  if (
+    process.env.YOUTUBE_COOKIES &&
+    fs.existsSync(YOUTUBE_COOKIE_FILE)
+  ) {
+
+    return [
+      '--cookies',
+      YOUTUBE_COOKIE_FILE
+    ];
+
+  }
+
+
+  return [];
+
+}
+
+
+// Prepare cookies when server starts.
+const youtubeCookiesConfigured =
+  prepareYoutubeCookies();
+
+
+// ──────────────────────────────────────────────
 // CORS + JSON + static files
 // ──────────────────────────────────────────────
 
 app.use(express.static(__dirname));
 app.use(express.json());
+
 
 app.use((req, res, next) => {
 
@@ -57,7 +159,9 @@ app.use((req, res, next) => {
   );
 
   if (req.method === 'OPTIONS') {
+
     return res.sendStatus(200);
+
   }
 
   next();
@@ -81,17 +185,23 @@ function checkYtdlp() {
       }
     );
 
-    proc.on('close', (code) => {
+    proc.on(
+      'close',
+      (code) => {
 
-      resolve(code === 0);
+        resolve(code === 0);
 
-    });
+      }
+    );
 
-    proc.on('error', () => {
+    proc.on(
+      'error',
+      () => {
 
-      resolve(false);
+        resolve(false);
 
-    });
+      }
+    );
 
   });
 
@@ -114,17 +224,23 @@ function checkFfmpeg() {
       }
     );
 
-    proc.on('close', (code) => {
+    proc.on(
+      'close',
+      (code) => {
 
-      resolve(code === 0);
+        resolve(code === 0);
 
-    });
+      }
+    );
 
-    proc.on('error', () => {
+    proc.on(
+      'error',
+      () => {
 
-      resolve(false);
+        resolve(false);
 
-    });
+      }
+    );
 
   });
 
@@ -142,8 +258,6 @@ function streamViaYtdlp(
   itag
 ) {
 
-  // Check if yt-dlp is available
-
   const proc = spawn(
     'yt-dlp',
     ['--version'],
@@ -152,221 +266,222 @@ function streamViaYtdlp(
     }
   );
 
-  proc.on('error', () => {
 
-    if (!res.headersSent) {
-
-      return res.status(500).json({
-        error:
-          'yt-dlp not found. Install it: pip install yt-dlp',
-        hint:
-          'brew install yt-dlp or pip3 install yt-dlp'
-      });
-
-    }
-
-  });
-
-  proc.on('close', (code) => {
-
-    if (code !== 0) {
+  proc.on(
+    'error',
+    () => {
 
       if (!res.headersSent) {
 
         return res.status(500).json({
-          error: 'yt-dlp not available'
+
+          error:
+            'yt-dlp not found. Install it: pip install yt-dlp',
+
+          hint:
+            'brew install yt-dlp or pip3 install yt-dlp'
+
         });
 
       }
 
-      return;
-
     }
+  );
 
 
-    // ──────────────────────────────────────────
-    // yt-dlp is available
-    // ──────────────────────────────────────────
+  proc.on(
+    'close',
+    (code) => {
 
-    const ytUrl =
-      videoIdOrUrl.includes('youtube.com') ||
-      videoIdOrUrl.includes('youtu.be')
-        ? videoIdOrUrl
-        : `https://www.youtube.com/watch?v=${videoIdOrUrl}`;
-
-
-    const args = [
-
-      '-f',
-
-      itag
-        ? String(itag)
-        : '140/251/250/249/139/bestaudio',
-
-      '-o',
-      '-',
-
-      '--no-playlist',
-
-      '--no-warnings',
-
-      '--verbose',
-
-      '--no-progress',
-
-      ytUrl
-
-    ];
-
-
-    console.log(
-      `  📡 yt-dlp ${args.join(' ')}`
-    );
-
-
-    const ytProc = spawn(
-      'yt-dlp',
-      args,
-      {
-        stdio: [
-          'ignore',
-          'pipe',
-          'pipe'
-        ],
-        timeout: 0
-      }
-    );
-
-
-    // ──────────────────────────────────────────
-    // Content type
-    // ──────────────────────────────────────────
-
-    const ext =
-      itag === 251 ||
-      itag === 250 ||
-      itag === 249
-        ? 'audio/webm'
-        : 'audio/mp4';
-
-
-    res.setHeader(
-      'Content-Type',
-      ext
-    );
-
-    res.setHeader(
-      'Cache-Control',
-      'no-cache'
-    );
-
-    res.setHeader(
-      'X-Stream-Backend',
-      'yt-dlp'
-    );
-
-
-    // ──────────────────────────────────────────
-    // Capture stderr
-    // ──────────────────────────────────────────
-
-    let stderr = '';
-
-    ytProc.stderr.on(
-      'data',
-      (d) => {
-
-        stderr += d.toString();
-
-      }
-    );
-
-
-    // ──────────────────────────────────────────
-    // Stream audio
-    // ──────────────────────────────────────────
-
-    ytProc.stdout.pipe(res);
-
-
-    // ──────────────────────────────────────────
-    // yt-dlp error
-    // ──────────────────────────────────────────
-
-    ytProc.on(
-      'error',
-      (err) => {
-
-        console.error(
-          'yt-dlp error:',
-          err.message
-        );
+      if (code !== 0) {
 
         if (!res.headersSent) {
 
-          streamFallback(
-            res,
-            videoIdOrUrl,
-            itag
-          );
+          return res.status(500).json({
+
+            error:
+              'yt-dlp not available'
+
+          });
 
         }
 
+        return;
+
       }
-    );
 
 
-    // ──────────────────────────────────────────
-    // yt-dlp exit
-    // ──────────────────────────────────────────
+      const ytUrl =
+        videoIdOrUrl.includes('youtube.com') ||
+        videoIdOrUrl.includes('youtu.be')
+          ? videoIdOrUrl
+          : `https://www.youtube.com/watch?v=${videoIdOrUrl}`;
 
-    ytProc.on(
-      'close',
-      (code) => {
 
-        if (code !== 0 && !res.headersSent) {
+      const args = [
+
+        '-f',
+
+        itag
+          ? String(itag)
+          : '140/251/250/249/139/bestaudio',
+
+        '-o',
+        '-',
+
+        '--no-playlist',
+
+        '--no-warnings',
+
+        '--verbose',
+
+        '--no-progress',
+
+        ...getYoutubeCookieArgs(),
+
+        ytUrl
+
+      ];
+
+
+      console.log(
+        `  📡 yt-dlp streaming: ${videoIdOrUrl}`
+      );
+
+
+      if (
+        process.env.YOUTUBE_COOKIES
+      ) {
+
+        console.log(
+          '  🍪 yt-dlp YouTube cookies: ENABLED'
+        );
+
+      }
+
+
+      const ytProc = spawn(
+        'yt-dlp',
+        args,
+        {
+          stdio: [
+            'ignore',
+            'pipe',
+            'pipe'
+          ],
+          timeout: 0
+        }
+      );
+
+
+      const ext =
+        itag === 251 ||
+        itag === 250 ||
+        itag === 249
+          ? 'audio/webm'
+          : 'audio/mp4';
+
+
+      res.setHeader(
+        'Content-Type',
+        ext
+      );
+
+      res.setHeader(
+        'Cache-Control',
+        'no-cache'
+      );
+
+      res.setHeader(
+        'X-Stream-Backend',
+        'yt-dlp'
+      );
+
+
+      let stderr = '';
+
+
+      ytProc.stderr.on(
+        'data',
+        (d) => {
+
+          stderr += d.toString();
+
+        }
+      );
+
+
+      ytProc.stdout.pipe(res);
+
+
+      ytProc.on(
+        'error',
+        (err) => {
 
           console.error(
-            'yt-dlp stderr:',
-            stderr.slice(0, 500)
+            'yt-dlp error:',
+            err.message
           );
 
-          streamFallback(
-            res,
-            videoIdOrUrl,
-            itag
-          );
 
-        }
+          if (!res.headersSent) {
 
-      }
-    );
-
-
-    // ──────────────────────────────────────────
-    // Client disconnected
-    // ──────────────────────────────────────────
-
-    res.on(
-      'close',
-      () => {
-
-        if (!ytProc.killed) {
-
-          try {
-
-            ytProc.kill(
-              'SIGKILL'
+            streamFallback(
+              res,
+              videoIdOrUrl,
+              itag
             );
 
-          } catch (_) {}
+          }
 
         }
+      );
 
-      }
-    );
 
-  });
+      ytProc.on(
+        'close',
+        (code) => {
+
+          if (code !== 0 && !res.headersSent) {
+
+            console.error(
+              'yt-dlp stderr:',
+              stderr.slice(0, 1000)
+            );
+
+
+            streamFallback(
+              res,
+              videoIdOrUrl,
+              itag
+            );
+
+          }
+
+        }
+      );
+
+
+      res.on(
+        'close',
+        () => {
+
+          if (!ytProc.killed) {
+
+            try {
+
+              ytProc.kill(
+                'SIGKILL'
+              );
+
+            } catch (_) {}
+
+          }
+
+        }
+      );
+
+    });
 
 }
 
@@ -404,8 +519,10 @@ async function streamFallback(
     if (!audio || !audio.url) {
 
       return res.status(500).json({
+
         error:
           'No stream URL available'
+
       });
 
     }
@@ -441,8 +558,10 @@ async function streamFallback(
             'GET',
 
           headers: {
+
             'User-Agent':
               'com.google.android.youtube/20.10.38'
+
           }
 
         },
@@ -455,10 +574,12 @@ async function streamFallback(
               'audio/mp4'
           );
 
+
           res.setHeader(
             'X-Stream-Backend',
             'innertube-fallback'
           );
+
 
           fetchRes.pipe(res);
 
@@ -473,8 +594,10 @@ async function streamFallback(
         if (!res.headersSent) {
 
           res.status(502).json({
+
             error:
               err.message
+
           });
 
         }
@@ -491,8 +614,10 @@ async function streamFallback(
     if (!res.headersSent) {
 
       res.status(500).json({
+
         error:
           err.message
+
       });
 
     }
@@ -503,7 +628,9 @@ async function streamFallback(
 
 
 // ──────────────────────────────────────────────
-// NEW MOMO-2 MP3 STREAMING ENDPOINT
+// MOMO-2 MP3 STREAMING ENDPOINT
+//
+// GET /api/streammp3/:videoId
 //
 // YouTube
 //    ↓
@@ -511,13 +638,11 @@ async function streamFallback(
 //    ↓
 // FFmpeg
 //    ↓
-// MP3 128 kbps
+// MP3 128 kbps / 44.1 kHz
 //    ↓
 // HTTP
 //    ↓
 // MOMO-2 ESP32-S3
-//
-// GET /api/streammp3/:videoId
 // ──────────────────────────────────────────────
 
 app.get(
@@ -527,10 +652,6 @@ app.get(
     const videoId =
       req.params.videoId;
 
-
-    // ──────────────────────────────────────────
-    // Validate YouTube video ID
-    // ──────────────────────────────────────────
 
     if (
       !/^[a-zA-Z0-9_-]{11}$/.test(
@@ -562,10 +683,6 @@ app.get(
 
 
     try {
-
-      // ────────────────────────────────────────
-      // HTTP response headers
-      // ────────────────────────────────────────
 
       res.statusCode = 200;
 
@@ -607,52 +724,71 @@ app.get(
 
 
       // ────────────────────────────────────────
-      // Start yt-dlp
+      // yt-dlp arguments
       // ────────────────────────────────────────
+
+      const ytdlpArgs = [
+
+        '--no-playlist',
+
+        '--no-warnings',
+
+        '--verbose',
+
+        '--no-progress',
+
+        '-f',
+        'bestaudio/best',
+
+        ...getYoutubeCookieArgs(),
+
+        '-o',
+        '-',
+
+        youtubeUrl
+
+      ];
+
 
       console.log(
         `[streammp3] Starting yt-dlp: ${videoId}`
       );
 
 
+      if (
+        process.env.YOUTUBE_COOKIES
+      ) {
+
+        console.log(
+          '[streammp3] YouTube cookies: ENABLED'
+        );
+
+      } else {
+
+        console.log(
+          '[streammp3] YouTube cookies: NOT CONFIGURED'
+        );
+
+      }
+
+
       ytdlp =
         spawn(
           'yt-dlp',
-          [
-
-            '--no-playlist',
-
-            '--no-warnings',
-
-            '--verbose',
-
-            '--no-progress',
-
-            '-f',
-            'bestaudio/best',
-
-            '-o',
-            '-',
-
-            youtubeUrl
-
-          ],
+          ytdlpArgs,
           {
-
             stdio: [
               'ignore',
               'pipe',
               'pipe'
             ],
-
             timeout: 0
-
           }
         );
 
 
       // ────────────────────────────────────────
-      // Start FFmpeg
+      // FFmpeg
       // ────────────────────────────────────────
 
       console.log(
@@ -670,53 +806,42 @@ app.get(
             '-loglevel',
             'error',
 
-            // Read input from yt-dlp
             '-i',
             'pipe:0',
 
-            // Audio only
             '-vn',
 
-            // Stereo
             '-ac',
             '2',
 
-            // Sample rate
             '-ar',
             '44100',
 
-            // MP3 bitrate
             '-b:a',
             '128k',
 
-            // MP3 encoder
             '-codec:a',
             'libmp3lame',
 
-            // MP3 output
             '-f',
             'mp3',
 
-            // Output to stdout
             'pipe:1'
 
           ],
           {
-
             stdio: [
               'pipe',
               'pipe',
               'pipe'
             ],
-
             timeout: 0
-
           }
         );
 
 
       // ────────────────────────────────────────
-      // PIPE:
+      // PIPE
       //
       // yt-dlp stdout
       //       ↓
@@ -737,10 +862,6 @@ app.get(
       );
 
 
-      // ────────────────────────────────────────
-      // yt-dlp diagnostic buffer
-      // ────────────────────────────────────────
-
       let ytdlpError = '';
 
 
@@ -754,10 +875,6 @@ app.get(
         }
       );
 
-
-      // ────────────────────────────────────────
-      // FFmpeg errors
-      // ────────────────────────────────────────
 
       ffmpeg.stderr.on(
         'data',
@@ -879,7 +996,7 @@ app.get(
             if (ytdlpError) {
 
               console.error(
-                `[streammp3] yt-dlp message: ${ytdlpError.slice(0, 1000)}`
+                `[streammp3] yt-dlp message: ${ytdlpError.slice(0, 1500)}`
               );
 
             }
@@ -1217,19 +1334,22 @@ app.get(
         'YouTube Audio API',
 
       version:
-        '1.1.0',
+        '1.2.0',
 
       noApiKeyRequired:
         true,
 
       engine:
-        'InnerTube + yt-dlp',
+        'InnerTube + yt-dlp + FFmpeg',
 
       ytdlpAvailable:
         hasYtdlp,
 
       ffmpegAvailable:
         hasFfmpeg,
+
+      youtubeCookiesConfigured:
+        !!process.env.YOUTUBE_COOKIES,
 
       momoMp3Endpoint:
         '/api/streammp3/:videoId'
@@ -1365,8 +1485,6 @@ app.get(
   </p>
 
 
-  <!-- SEARCH -->
-
   <div class="endpoint">
 
     <p>
@@ -1391,8 +1509,6 @@ app.get(
   </div>
 
 
-  <!-- VIDEO -->
-
   <div class="endpoint">
 
     <p>
@@ -1413,8 +1529,6 @@ app.get(
 
   </div>
 
-
-  <!-- EXISTING STREAM -->
 
   <div class="endpoint">
 
@@ -1437,8 +1551,6 @@ app.get(
   </div>
 
 
-  <!-- ITAG STREAM -->
-
   <div class="endpoint">
 
     <p>
@@ -1459,8 +1571,6 @@ app.get(
 
   </div>
 
-
-  <!-- MOMO MP3 -->
 
   <div class="endpoint momo">
 
@@ -1490,14 +1600,20 @@ app.get(
 
 
     <p>
+      YouTube cookies are supported through the
+      Railway
+      <code>YOUTUBE_COOKIES</code>
+      variable.
+    </p>
+
+
+    <p>
       Designed for MOMO-2 ESP32-S3
       MP3 playback.
     </p>
 
   </div>
 
-
-  <!-- HEALTH -->
 
   <div class="endpoint">
 
@@ -1514,7 +1630,7 @@ app.get(
     </p>
 
     <p>
-      Check yt-dlp and FFmpeg availability.
+      Check yt-dlp, FFmpeg and YouTube-cookie configuration.
     </p>
 
   </div>
@@ -1663,6 +1779,8 @@ app.listen(
 ║                                              ║
 ║   Server: http://localhost:${PORT}
 ║   Health: /api/health                        ║
+║                                              ║
+║   YouTube Cookies: ${youtubeCookiesConfigured ? 'ENABLED ' : 'DISABLED'}             ║
 ║                                              ║
 ║   MOMO MP3:                                  ║
 ║   /api/streammp3/:videoId                    ║

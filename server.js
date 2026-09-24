@@ -1,7 +1,7 @@
 /**
  * YouTube Audio Streaming API Server
  *
- * Version: 1.2.3
+ * Version: 1.3.0
  *
  * Uses:
  *   - InnerTube for metadata/search
@@ -39,7 +39,22 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-const VERSION = '1.2.3';
+const VERSION = '1.3.0';
+
+// PO-token provider configuration. The recommended yt-dlp setup is
+// bgutil-ytdlp-pot-provider with the mweb YouTube client.
+// Example: http://127.0.0.1:4416 when the provider runs beside this service.
+const YOUTUBE_POT_PROVIDER_URL = (
+  process.env.YOUTUBE_POT_PROVIDER_URL ||
+  'http://127.0.0.1:4416'
+).trim();
+
+const YOUTUBE_POT_ENABLED =
+  process.env.YOUTUBE_POT_ENABLED !== 'false' &&
+  process.env.YOUTUBE_POT_PROVIDER_URL !== '';
+
+const YOUTUBE_POT_CLIENT =
+  (process.env.YOUTUBE_POT_CLIENT || 'mweb').trim();
 
 const YOUTUBE_COOKIE_FILE = path.join(
   os.tmpdir(),
@@ -148,6 +163,40 @@ function getYoutubeCookieArgs() {
   }
 
   return [];
+}
+
+
+function getYoutubePotArgs() {
+  if (!YOUTUBE_POT_ENABLED || !YOUTUBE_POT_PROVIDER_URL) {
+    return [];
+  }
+
+  return [
+    '--extractor-args',
+    `youtube:player-client=${YOUTUBE_POT_CLIENT}`,
+    '--extractor-args',
+    `youtubepot-bgutilhttp:base_url=${YOUTUBE_POT_PROVIDER_URL}`
+  ];
+}
+
+
+function appendYoutubeExtractionArgs(args) {
+  const potArgs = getYoutubePotArgs();
+
+  if (potArgs.length) {
+    args.push(...potArgs);
+  }
+
+  // yt-dlp's YouTube extractor may need a JavaScript runtime for current
+  // player/n-signature solving. Deno is used when available on Railway.
+  if (process.env.YOUTUBE_JS_RUNTIME) {
+    args.push(
+      '--js-runtimes',
+      process.env.YOUTUBE_JS_RUNTIME
+    );
+  }
+
+  return args;
 }
 
 
@@ -350,6 +399,8 @@ function streamViaYtdlp(
     if (cookieArgs.length) {
       args.push(...cookieArgs);
     }
+
+    appendYoutubeExtractionArgs(args);
 
     args.push(
       videoIdOrUrl.startsWith('http')
@@ -794,16 +845,20 @@ app.get(
 // ============================================================
 // MOMO-2 MP3 STREAM
 //
-// YouTube -> yt-dlp -> FFmpeg -> MP3 -> MOMO-2
-//
-// IMPORTANT:
-// Do NOT send HTTP 200 until FFmpeg has actually produced audio.
-// If yt-dlp is blocked/fails before audio is produced, return 502.
+// YouTube
+//    ↓
+// yt-dlp
+//    ↓
+// FFmpeg
+//    ↓
+// MP3 128 kbps / 44.1 kHz stereo
+//    ↓
+// MOMO-2
 // ============================================================
 
 app.get(
   '/api/streammp3/:videoId',
-  (req, res) => {
+  async (req, res) => {
 
     const videoId = String(req.params.videoId || '').trim();
 
@@ -815,430 +870,299 @@ app.get(
       });
     }
 
-    let ytdlp = null;
-    let ffmpeg = null;
-
     let clientDisconnected = false;
-    let responseStarted = false;
     let responseFinished = false;
-    let terminalHandled = false;
-
-    let bytesFromYtdlp = 0;
-    let bytesToClient = 0;
-
-    let ytdlpStderr = '';
-    let ffmpegStderr = '';
-
-    const pendingAudio = [];
-    let pendingBytes = 0;
+    let activeYtdlp = null;
+    let activeFfmpeg = null;
 
     const extractionStrategies = [
       {
-        name: 'default',
-        extractorArgs: null,
-        cookieArgs: true
+        name: 'mweb+PO-token',
+        args: [
+          '--extractor-args',
+          `youtube:player-client=${YOUTUBE_POT_CLIENT}`,
+          '--extractor-args',
+          `youtubepot-bgutilhttp:base_url=${YOUTUBE_POT_PROVIDER_URL}`
+        ]
       },
       {
-        name: 'web_embedded',
-        extractorArgs: 'youtube:player_client=web_embedded',
-        cookieArgs: false
+        name: 'web-embedded',
+        args: [
+          '--extractor-args',
+          'youtube:player-client=web_embedded'
+        ]
       },
       {
-        name: 'web_music',
-        extractorArgs: 'youtube:player_client=web_music',
-        cookieArgs: false
-      },
-      {
-        name: 'web_embedded_default',
-        extractorArgs: 'youtube:player_client=web_embedded,default',
-        cookieArgs: true
+        name: 'web-music',
+        args: [
+          '--extractor-args',
+          'youtube:player-client=web_music'
+        ]
       }
     ];
 
-    const sendError = (status, message, details = '') => {
-      if (clientDisconnected || responseStarted || res.headersSent || res.destroyed) {
-        return false;
-      }
+    const cookieArgs = getYoutubeCookieArgs();
 
-      const body = {
-        error: message
-      };
-
-      if (details) {
-        body.details = details;
-      }
-
-      try {
-        res.status(status).json(body);
-        return true;
-      } catch (err) {
-        console.error('[streammp3] Error response failed:', err.message);
-        return false;
-      }
-    };
-
-    const startResponse = () => {
-      if (responseStarted || clientDisconnected || res.destroyed) {
-        return;
-      }
-
-      responseStarted = true;
-
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-      res.setHeader('Pragma', 'no-cache');
-      res.setHeader('Accept-Ranges', 'none');
-      res.setHeader('X-Stream-Backend', 'yt-dlp-ffmpeg-mp3');
-      res.setHeader('X-Stream-Format', 'mp3-44100-stereo-128k');
-
-      console.log(`[streammp3] Audio response started: ${videoId}`);
-
-      for (const chunk of pendingAudio) {
-        if (!res.destroyed && res.writable) {
-          res.write(chunk);
-          bytesToClient += chunk.length;
-        }
-      }
-
-      pendingAudio.length = 0;
-      pendingBytes = 0;
-    };
-
-    const terminateChildren = () => {
-      if (ytdlp) safeKill(ytdlp);
-      if (ffmpeg) safeKill(ffmpeg);
-    };
-
-    const cleanupClient = () => {
-      if (clientDisconnected) return;
-      clientDisconnected = true;
-      terminateChildren();
-    };
+    function killActiveProcesses() {
+      if (activeYtdlp) safeKill(activeYtdlp);
+      if (activeFfmpeg) safeKill(activeFfmpeg);
+    }
 
     req.on('aborted', () => {
-      console.log(`[streammp3] Client aborted: ${videoId}`);
-      cleanupClient();
+      clientDisconnected = true;
+      killActiveProcesses();
     });
 
     res.on('close', () => {
-      if (!res.writableEnded && !responseFinished && !responseStarted) {
-        console.log(`[streammp3] Client disconnected before audio started: ${videoId}`);
-        cleanupClient();
-      } else if (!res.writableEnded && !responseFinished && responseStarted) {
-        console.log(`[streammp3] Client disconnected during audio: ${videoId}`);
-        cleanupClient();
+      if (!res.writableEnded && !responseFinished) {
+        clientDisconnected = true;
+        killActiveProcesses();
       }
     });
 
     res.on('error', (err) => {
       if (err && ['EPIPE', 'ECONNRESET', 'ERR_STREAM_DESTROYED'].includes(err.code)) {
-        console.log(`[streammp3] Expected response error: ${err.code}`);
+        clientDisconnected = true;
       } else {
         console.error('[streammp3] Response error:', err.message);
       }
-      cleanupClient();
+      killActiveProcesses();
     });
 
-    const runStrategy = (strategy) => new Promise((resolve) => {
-      if (clientDisconnected || responseStarted) {
-        resolve({ ok: false, reason: 'client-disconnected' });
-        return;
-      }
+    async function runStrategy(strategy) {
+      return new Promise((resolve) => {
+        if (clientDisconnected) return resolve({ ok: false, aborted: true });
 
-      bytesFromYtdlp = 0;
-      ytdlpStderr = '';
-      ffmpegStderr = '';
-      pendingAudio.length = 0;
-      pendingBytes = 0;
+        let ytdlp = null;
+        let ffmpeg = null;
+        let settled = false;
+        let bytesFromYtdlp = 0;
+        let bytesToClient = 0;
+        let ytdlpStderr = '';
+        let ffmpegStderr = '';
+        let ffmpegStarted = false;
+        let outputStarted = false;
 
-      const args = [
-        '--no-playlist',
-        '--no-warnings',
-        '--no-progress',
-        '--force-ipv4',
-        '--no-check-certificates',
-        '-f',
-        'bestaudio/best',
-        '-o',
-        '-'
-      ];
+        activeYtdlp = null;
+        activeFfmpeg = null;
 
-      if (strategy.extractorArgs) {
-        args.push('--extractor-args', strategy.extractorArgs);
-      }
+        const finish = (result) => {
+          if (settled) return;
+          settled = true;
+          if (activeYtdlp === ytdlp) activeYtdlp = null;
+          if (activeFfmpeg === ffmpeg) activeFfmpeg = null;
+          resolve(result);
+        };
 
-      if (strategy.cookieArgs) {
-        const cookieArgs = getYoutubeCookieArgs();
-        if (cookieArgs.length) args.push(...cookieArgs);
-      }
+        const commonArgs = [
+          '--no-playlist',
+          '--no-warnings',
+          '--no-progress',
+          '--force-ipv4',
+          '--retries', '2',
+          '--fragment-retries', '2',
+          '-f', 'bestaudio/best',
+          '-o', '-'
+        ];
 
-      args.push(`https://www.youtube.com/watch?v=${videoId}`);
+        if (cookieArgs.length) commonArgs.push(...cookieArgs);
+        commonArgs.push(...strategy.args);
 
-      console.log(`[streammp3] Extraction strategy: ${strategy.name}`);
-      console.log(`[streammp3] Starting yt-dlp: ${videoId}`);
-
-      ytdlp = spawn('yt-dlp', args, {
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-
-      attachChildErrorHandler(ytdlp, `streammp3-ytdlp-${strategy.name}`);
-      attachStreamErrorHandler(ytdlp.stdout, `streammp3-ytdlp-stdout-${strategy.name}`);
-      attachStreamErrorHandler(ytdlp.stderr, `streammp3-ytdlp-stderr-${strategy.name}`);
-
-      ffmpeg = spawn('ffmpeg', [
-        '-hide_banner',
-        '-loglevel',
-        'warning',
-        '-i',
-        'pipe:0',
-        '-vn',
-        '-ac',
-        '2',
-        '-ar',
-        '44100',
-        '-b:a',
-        '128k',
-        '-codec:a',
-        'libmp3lame',
-        '-f',
-        'mp3',
-        'pipe:1'
-      ], {
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      attachChildErrorHandler(ffmpeg, `streammp3-ffmpeg-${strategy.name}`);
-      attachStreamErrorHandler(ffmpeg.stdin, `streammp3-ffmpeg-stdin-${strategy.name}`);
-      attachStreamErrorHandler(ffmpeg.stdout, `streammp3-ffmpeg-stdout-${strategy.name}`);
-      attachStreamErrorHandler(ffmpeg.stderr, `streammp3-ffmpeg-stderr-${strategy.name}`);
-
-      let ytdlpClosed = false;
-      let ffmpegClosed = false;
-      let ytdlpCode = null;
-      let ffmpegCode = null;
-      let ffmpegSignal = null;
-      let settled = false;
-      let inputEnded = false;
-
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
-
-      ytdlp.stderr.on('data', (data) => {
-        const text = data.toString();
-        ytdlpStderr += text;
-        if (ytdlpStderr.length > 16000) ytdlpStderr = ytdlpStderr.slice(-16000);
-        const clean = text.trim();
-        if (clean) console.log(`[streammp3] yt-dlp: ${clean}`);
-      });
-
-      ffmpeg.stderr.on('data', (data) => {
-        const text = data.toString();
-        ffmpegStderr += text;
-        if (ffmpegStderr.length > 12000) ffmpegStderr = ffmpegStderr.slice(-12000);
-        const clean = text.trim();
-        if (clean) console.log(`[streammp3] FFmpeg: ${clean}`);
-      });
-
-      ytdlp.stdout.on('data', (chunk) => {
-        bytesFromYtdlp += chunk.length;
-
-        if (clientDisconnected || ffmpeg.stdin.destroyed || ffmpeg.stdin.writableEnded) {
-          return;
+        if (process.env.YOUTUBE_JS_RUNTIME) {
+          commonArgs.push('--js-runtimes', process.env.YOUTUBE_JS_RUNTIME);
         }
 
-        try {
-          const canContinue = ffmpeg.stdin.write(chunk);
-          if (!canContinue) {
-            ytdlp.stdout.pause();
-            ffmpeg.stdin.once('drain', () => {
-              if (!clientDisconnected && !ffmpeg.stdin.destroyed) {
-                ytdlp.stdout.resume();
-              }
-            });
-          }
-        } catch (err) {
-          if (err && ['EPIPE', 'ERR_STREAM_DESTROYED'].includes(err.code)) {
-            console.log(`[streammp3] FFmpeg input closed: ${err.code}`);
-          } else {
-            console.error('[streammp3] yt-dlp → FFmpeg error:', err.message);
-          }
-        }
-      });
+        commonArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
 
-      ytdlp.stdout.on('end', () => {
-        console.log(`[streammp3] yt-dlp stdout ended: ${bytesFromYtdlp} bytes`);
-        if (!inputEnded) {
-          inputEnded = true;
+        console.log(`[streammp3] Strategy: ${strategy.name}`);
+        console.log(`[streammp3] Starting yt-dlp for ${videoId}`);
+
+        ytdlp = spawn('yt-dlp', commonArgs, {
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+        activeYtdlp = ytdlp;
+
+        attachChildErrorHandler(ytdlp, `streammp3-${strategy.name}-ytdlp`);
+        attachStreamErrorHandler(ytdlp.stdout, `streammp3-${strategy.name}-stdout`);
+        attachStreamErrorHandler(ytdlp.stderr, `streammp3-${strategy.name}-stderr`);
+
+        ytdlp.stderr.on('data', (data) => {
+          const text = data.toString();
+          ytdlpStderr += text;
+          if (ytdlpStderr.length > 16000) ytdlpStderr = ytdlpStderr.slice(-16000);
+          console.log(`[streammp3] yt-dlp: ${text.trim()}`);
+        });
+
+        // FFmpeg is started immediately, but the HTTP response is NOT committed
+        // until actual MP3 bytes arrive. This prevents the old 200/empty-stream bug.
+        ffmpeg = spawn('ffmpeg', [
+          '-hide_banner',
+          '-loglevel', 'warning',
+          '-i', 'pipe:0',
+          '-vn',
+          '-ac', '2',
+          '-ar', '44100',
+          '-b:a', '128k',
+          '-codec:a', 'libmp3lame',
+          '-f', 'mp3',
+          'pipe:1'
+        ], {
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+        activeFfmpeg = ffmpeg;
+        ffmpegStarted = true;
+
+        attachChildErrorHandler(ffmpeg, `streammp3-${strategy.name}-ffmpeg`);
+        attachStreamErrorHandler(ffmpeg.stdin, `streammp3-${strategy.name}-ffmpeg-stdin`);
+        attachStreamErrorHandler(ffmpeg.stdout, `streammp3-${strategy.name}-ffmpeg-stdout`);
+        attachStreamErrorHandler(ffmpeg.stderr, `streammp3-${strategy.name}-ffmpeg-stderr`);
+
+        ffmpeg.stderr.on('data', (data) => {
+          const text = data.toString();
+          ffmpegStderr += text;
+          if (ffmpegStderr.length > 12000) ffmpegStderr = ffmpegStderr.slice(-12000);
+          console.log(`[streammp3] FFmpeg: ${text.trim()}`);
+        });
+
+        ytdlp.stdout.on('data', (chunk) => {
+          bytesFromYtdlp += chunk.length;
+
+          if (clientDisconnected || settled || ffmpeg.stdin.destroyed || ffmpeg.stdin.writableEnded) {
+            return;
+          }
+
           try {
-            if (!ffmpeg.stdin.destroyed && !ffmpeg.stdin.writableEnded) {
-              ffmpeg.stdin.end();
-            }
+            const ok = ffmpeg.stdin.write(chunk);
+            if (!ok) ytdlp.stdout.pause();
           } catch (err) {
             if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(err.code)) {
-              console.error('[streammp3] FFmpeg stdin end error:', err.message);
+              console.error('[streammp3] yt-dlp → FFmpeg error:', err.message);
             }
+            finish({ ok: false, aborted: clientDisconnected, bytesFromYtdlp, bytesToClient, ytdlpStderr, ffmpegStderr });
           }
-        }
-      });
+        });
 
-      ffmpeg.stdout.on('data', (chunk) => {
-        if (clientDisconnected) return;
-
-        if (!responseStarted) {
-          pendingAudio.push(chunk);
-          pendingBytes += chunk.length;
-          startResponse();
-          return;
-        }
-
-        try {
-          if (!res.destroyed && res.writable) {
-            res.write(chunk);
-            bytesToClient += chunk.length;
+        ffmpeg.stdin.on('drain', () => {
+          if (!clientDisconnected && !settled && ytdlp && !ytdlp.stdout.destroyed) {
+            ytdlp.stdout.resume();
           }
-        } catch (err) {
-          if (err && ['EPIPE', 'ECONNRESET', 'ERR_STREAM_DESTROYED'].includes(err.code)) {
-            console.log(`[streammp3] Client pipe closed: ${err.code}`);
-            cleanupClient();
-          } else {
-            console.error('[streammp3] FFmpeg → client error:', err.message);
+        });
+
+        ytdlp.stdout.on('end', () => {
+          console.log(`[streammp3] yt-dlp stdout ended: ${bytesFromYtdlp} bytes`);
+          try {
+            if (!ffmpeg.stdin.destroyed && !ffmpeg.stdin.writableEnded) ffmpeg.stdin.end();
+          } catch (_) {}
+        });
+
+        ffmpeg.stdout.on('data', (chunk) => {
+          if (clientDisconnected || settled) return;
+
+          bytesToClient += chunk.length;
+
+          if (!outputStarted) {
+            outputStarted = true;
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'audio/mpeg');
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Accept-Ranges', 'none');
+            res.setHeader('Transfer-Encoding', 'chunked');
+            res.setHeader('X-Stream-Backend', `yt-dlp-${strategy.name}-ffmpeg-mp3`);
+            console.log(`[streammp3] MP3 output started: ${videoId}`);
           }
-        }
-      });
 
-      ytdlp.on('error', (err) => {
-        if (err && !['EPIPE', 'ECONNRESET'].includes(err.code)) {
-          console.error('[streammp3] yt-dlp process error:', err.message);
-        }
-      });
+          try {
+            if (!res.destroyed && res.writable) res.write(chunk);
+          } catch (err) {
+            if (!['EPIPE', 'ECONNRESET', 'ERR_STREAM_DESTROYED'].includes(err.code)) {
+              console.error('[streammp3] FFmpeg → client error:', err.message);
+            }
+            clientDisconnected = true;
+            killActiveProcesses();
+          }
+        });
 
-      ffmpeg.on('error', (err) => {
-        if (err && !['EPIPE', 'ECONNRESET'].includes(err.code)) {
-          console.error('[streammp3] FFmpeg process error:', err.message);
-        }
-      });
+        ytdlp.on('close', (code) => {
+          console.log(`[streammp3] yt-dlp exited with code ${code}`);
+          if (code !== 0 && bytesFromYtdlp === 0) {
+            console.error(`[streammp3] yt-dlp message: ${ytdlpStderr.trim()}`);
+          }
+        });
 
-      ytdlp.on('close', (code) => {
-        ytdlpClosed = true;
-        ytdlpCode = code;
-        console.log(`[streammp3] yt-dlp exited with code ${code}`);
+        ffmpeg.on('close', (code, signal) => {
+          console.log(`[streammp3] FFmpeg exited with code ${code}${signal ? ` signal=${signal}` : ''}`);
+          console.log(`[streammp3] Audio bytes: yt-dlp=${bytesFromYtdlp}, client=${bytesToClient}`);
 
-        if (code !== 0 && bytesFromYtdlp === 0 && ytdlpStderr.trim()) {
-          console.log(`[streammp3] yt-dlp message: ${ytdlpStderr.trim()}`);
-        }
+          if (clientDisconnected) {
+            return finish({ ok: false, aborted: true, bytesFromYtdlp, bytesToClient, ytdlpStderr, ffmpegStderr });
+          }
 
-        if (ytdlpClosed && ffmpegClosed) {
-          finish({
-            ok: responseStarted && bytesToClient > 0,
-            ytdlpCode,
-            ffmpegCode,
-            ffmpegSignal,
-            bytesFromYtdlp,
-            bytesToClient,
-            ytdlpStderr,
-            ffmpegStderr
-          });
-        }
-      });
+          if (outputStarted && bytesToClient > 0 && code === 0) {
+            responseFinished = true;
+            try {
+              if (!res.destroyed && !res.writableEnded) res.end();
+            } catch (_) {}
+            return finish({ ok: true, bytesFromYtdlp, bytesToClient });
+          }
 
-      ffmpeg.on('close', (code, signal) => {
-        ffmpegClosed = true;
-        ffmpegCode = code;
-        ffmpegSignal = signal;
-
-        console.log(`[streammp3] FFmpeg exited with code ${code}` + (signal ? ` signal=${signal}` : ''));
-        console.log(`[streammp3] Audio bytes: yt-dlp=${bytesFromYtdlp}, client=${bytesToClient}`);
-
-        if (ytdlpClosed && ffmpegClosed) {
-          finish({
-            ok: responseStarted && bytesToClient > 0 && code === 0,
-            ytdlpCode,
-            ffmpegCode,
-            ffmpegSignal,
-            bytesFromYtdlp,
-            bytesToClient,
-            ytdlpStderr,
-            ffmpegStderr
-          });
-        }
-      });
-
-      // Safety timeout for a stuck extraction attempt.
-      setTimeout(() => {
-        if (!settled && !clientDisconnected) {
-          console.log(`[streammp3] Strategy timeout: ${strategy.name}`);
-          safeKill(ytdlp);
-          safeKill(ffmpeg);
           finish({
             ok: false,
-            ytdlpCode,
-            ffmpegCode,
-            ffmpegSignal,
             bytesFromYtdlp,
             bytesToClient,
             ytdlpStderr,
             ffmpegStderr,
-            timeout: true
+            ffmpegCode: code
           });
-        }
-      }, 30000);
-    });
+        });
 
-    (async () => {
-      for (const strategy of extractionStrategies) {
-        if (clientDisconnected || responseStarted) return;
+        ytdlp.on('error', (err) => {
+          if (err.code !== 'EPIPE' && err.code !== 'ECONNRESET') {
+            console.error('[streammp3] yt-dlp process error:', err.message);
+          }
+          if (bytesFromYtdlp === 0) {
+            finish({ ok: false, bytesFromYtdlp, bytesToClient, ytdlpStderr, ffmpegStderr });
+          }
+        });
 
-        const result = await runStrategy(strategy);
+        ffmpeg.on('error', (err) => {
+          if (err.code !== 'EPIPE' && err.code !== 'ECONNRESET') {
+            console.error('[streammp3] FFmpeg process error:', err.message);
+          }
+          finish({ ok: false, bytesFromYtdlp, bytesToClient, ytdlpStderr, ffmpegStderr });
+        });
+      });
+    }
 
-        if (clientDisconnected) return;
+    for (const strategy of extractionStrategies) {
+      if (clientDisconnected) return;
 
-        if (result.ok) {
-          responseFinished = true;
-          if (!res.destroyed && !res.writableEnded) res.end();
-          return;
-        }
+      const result = await runStrategy(strategy);
 
-        // A strategy that produced no usable audio is safe to retry.
-        // Do not send HTTP 200 unless FFmpeg actually produced MP3 bytes.
-        if (responseStarted) {
-          responseFinished = true;
-          if (!res.destroyed && !res.writableEnded) res.end();
-          return;
-        }
+      if (result.ok || result.aborted) return;
 
-        ytdlp = null;
-        ffmpeg = null;
-      }
+      console.log(`[streammp3] Strategy failed: ${strategy.name}`);
+    }
 
-      if (clientDisconnected || responseFinished) return;
+    if (!res.headersSent && !clientDisconnected) {
+      const details = [
+        'YouTube audio extraction failed.',
+        'The PO-token provider/client may not be installed or reachable.',
+        'Make sure bgutil-ytdlp-pot-provider is installed for yt-dlp and YOUTUBE_POT_PROVIDER_URL points to its HTTP server.',
+        'Last yt-dlp output:',
+        extractionStrategies.length ? 'See Railway logs for the individual strategy errors.' : ''
+      ].join('\n');
 
-      terminalHandled = true;
-
-      const combined = `${ytdlpStderr}\n${ffmpegStderr}`.trim();
-      const concise = combined.length > 12000
-        ? combined.slice(-12000)
-        : combined;
-
-      console.error(`[streammp3] All extraction strategies failed for ${videoId}`);
-
-      sendError(
-        502,
-        'YouTube audio extraction failed',
-        concise || 'yt-dlp/FFmpeg produced no playable audio'
-      );
-    })().catch((err) => {
-      if (clientDisconnected || terminalHandled) return;
-
-      console.error('[streammp3] Route error:', err.message);
-      sendError(502, 'YouTube audio extraction failed', err.message);
-    });
+      return res.status(502).json({
+        error: 'YouTube audio extraction failed',
+        details,
+        poTokenProvider: YOUTUBE_POT_ENABLED,
+        poTokenProviderUrl: YOUTUBE_POT_ENABLED ? YOUTUBE_POT_PROVIDER_URL : null,
+        poTokenClient: YOUTUBE_POT_ENABLED ? YOUTUBE_POT_CLIENT : null
+      });
+    }
   }
 );
-
 
 // ============================================================
 // HEALTH
@@ -1259,7 +1183,10 @@ app.get(
       service: 'YouTube Audio API',
       version: VERSION,
       noApiKeyRequired: true,
-      engine: 'InnerTube + yt-dlp + FFmpeg',
+      engine: 'InnerTube + yt-dlp + PO-token provider + FFmpeg',
+      poTokenProviderEnabled: YOUTUBE_POT_ENABLED,
+      poTokenProviderUrl: YOUTUBE_POT_ENABLED ? YOUTUBE_POT_PROVIDER_URL : null,
+      poTokenClient: YOUTUBE_POT_ENABLED ? YOUTUBE_POT_CLIENT : null,
       ytdlpAvailable: !!ytdlpVersion,
       ytdlpVersion: ytdlpVersion || null,
       ffmpegAvailable: !!ffmpegAvailable,
@@ -1313,6 +1240,13 @@ app.get(
 
 <p>
 Version: <b>${VERSION}</b>
+</p>
+
+<p>
+PO-token provider: <b>${YOUTUBE_POT_ENABLED ? 'ENABLED' : 'DISABLED'}</b>
+</p>
+
+<p>
 </p>
 
 <h2>Endpoints</h2>

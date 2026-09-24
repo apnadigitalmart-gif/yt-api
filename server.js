@@ -1,7 +1,7 @@
 /\*\*
  \* YouTube Audio Streaming API Server
  \*
- \* Version: 1.2.1
+ \* Version: 1.2.2
  \*
  \* Uses:
  \*   - InnerTube for metadata/search
